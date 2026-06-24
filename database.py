@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -9,8 +10,8 @@ from typing import Iterable
 @dataclass(frozen=True)
 class User:
     id: int
+    email: str
     username: str
-    auth_token: str
 
 
 @dataclass(frozen=True)
@@ -64,8 +65,11 @@ class DormiXRepository:
             """
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT NOT NULL UNIQUE,
-                auth_token TEXT NOT NULL
+                email TEXT NOT NULL UNIQUE,
+                username TEXT NOT NULL,
+                otp_code TEXT,
+                otp_expires_at TEXT,
+                telegram_id TEXT UNIQUE
             );
 
             CREATE TABLE IF NOT EXISTS debts (
@@ -108,32 +112,57 @@ class DormiXRepository:
         )
         self.conn.commit()
 
-    def create_user(self, username: str, auth_token: str) -> User:
-        username = self._normalize_username(username)
+    def create_user(self, email: str, username: str) -> User:
+        email = self._normalize_email(email)
         with self.conn:
             cur = self.conn.execute(
-                "INSERT INTO users (username, auth_token) VALUES (?, ?)",
-                (username, auth_token.strip()),
+                "INSERT INTO users (email, username) VALUES (?, ?)",
+                (email, username.strip()),
             )
-        return User(id=cur.lastrowid, username=username, auth_token=auth_token.strip())
+        return User(id=cur.lastrowid, email=email, username=username.strip())
 
-    def get_user_by_username(self, username: str) -> User | None:
+    def get_user_by_email(self, email: str) -> User | None:
         row = self.conn.execute(
-            "SELECT id, username, auth_token FROM users WHERE username = ?",
-            (self._normalize_username(username),),
+            "SELECT id, email, username FROM users WHERE email = ?",
+            (self._normalize_email(email),),
         ).fetchone()
         return self._row_to_user(row) if row else None
 
     def get_user_by_id(self, user_id: int) -> User | None:
         row = self.conn.execute(
-            "SELECT id, username, auth_token FROM users WHERE id = ?",
+            "SELECT id, email, username FROM users WHERE id = ?",
             (user_id,),
         ).fetchone()
         return self._row_to_user(row) if row else None
 
     def list_users(self) -> list[User]:
-        rows = self.conn.execute("SELECT id, username, auth_token FROM users ORDER BY username").fetchall()
+        rows = self.conn.execute("SELECT id, email, username FROM users ORDER BY username").fetchall()
         return [self._row_to_user(row) for row in rows]
+
+    def set_otp(self, email: str, otp_code: str) -> None:
+        # OTP expires in 5 minutes
+        expires_at = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=5)).isoformat()
+        with self.conn:
+            self.conn.execute(
+                "UPDATE users SET otp_code = ?, otp_expires_at = ? WHERE email = ?",
+                (otp_code, expires_at, self._normalize_email(email))
+            )
+
+    def verify_otp(self, email: str, provided_code: str) -> bool:
+        row = self.conn.execute(
+            "SELECT otp_code, otp_expires_at FROM users WHERE email = ?",
+            (self._normalize_email(email),)
+        ).fetchone()
+        
+        if not row or not row["otp_code"]:
+            return False
+            
+        # Check expiration
+        expires_at = datetime.datetime.fromisoformat(row["otp_expires_at"])
+        if datetime.datetime.now(datetime.timezone.utc) > expires_at:
+            return False
+            
+        return row["otp_code"] == provided_code.strip()
 
     def add_debt(
         self,
@@ -158,29 +187,15 @@ class DormiXRepository:
             )
         return int(cur.lastrowid)
 
-    def list_pending_debts_for_borrower(self, borrower_id: int) -> list[DebtRecord]:
+    def get_pending_for_user(self, email: str) -> list[DebtRecord]:
+        normalized = self._normalize_email(email)
         rows = self.conn.execute(
             """
             SELECT d.*, b.username AS borrower_username, l.username AS lender_username
             FROM debts d
             JOIN users b ON b.id = d.borrower_id
             JOIN users l ON l.id = d.lender_id
-            WHERE d.borrower_id = ? AND d.status = 'pending'
-            ORDER BY d.created_at, d.id
-            """,
-            (borrower_id,),
-        ).fetchall()
-        return [self._row_to_debt(row) for row in rows]
-
-    def get_pending_for_user(self, username: str) -> list[DebtRecord]:
-        normalized = self._normalize_username(username)
-        rows = self.conn.execute(
-            """
-            SELECT d.*, b.username AS borrower_username, l.username AS lender_username
-            FROM debts d
-            JOIN users b ON b.id = d.borrower_id
-            JOIN users l ON l.id = d.lender_id
-            WHERE b.username = ? AND d.status = 'pending'
+            WHERE b.email = ? AND d.status = 'pending'
             ORDER BY d.created_at, d.id
             """,
             (normalized,),
@@ -202,9 +217,6 @@ class DormiXRepository:
         rows = self.conn.execute(sql, params).fetchall()
         return [self._row_to_debt(row) for row in rows]
 
-    def list_approved_debts_for_engine(self) -> list[DebtRecord]:
-        return self.list_approved()
-
     def list_approved(self) -> list[DebtRecord]:
         rows = self.conn.execute(
             """
@@ -217,21 +229,6 @@ class DormiXRepository:
             """
         ).fetchall()
         return [self._row_to_debt(row) for row in rows]
-
-    def update_debt_status(self, debt_id: int, borrower_id: int, status: str) -> bool:
-        if status not in {"approved", "rejected"}:
-            raise ValueError("Debt status must be approved or rejected.")
-
-        with self.conn:
-            cur = self.conn.execute(
-                """
-                UPDATE debts
-                SET status = ?
-                WHERE id = ? AND borrower_id = ? AND status = 'pending'
-                """,
-                (status, debt_id, borrower_id),
-            )
-        return cur.rowcount == 1
 
     def update_status(self, debt_id: int, new_status: str) -> bool:
         if new_status not in {"approved", "rejected"}:
@@ -307,15 +304,15 @@ class DormiXRepository:
         return int(cur.lastrowid)
 
     @staticmethod
-    def _normalize_username(username: str) -> str:
-        normalized = username.strip().lower()
-        if not normalized:
-            raise ValueError("Username cannot be empty.")
+    def _normalize_email(email: str) -> str:
+        normalized = email.strip().lower()
+        if not normalized or "@" not in normalized:
+            raise ValueError("A valid student email address is required.")
         return normalized
 
     @staticmethod
     def _row_to_user(row: sqlite3.Row) -> User:
-        return User(id=int(row["id"]), username=str(row["username"]), auth_token=str(row["auth_token"]))
+        return User(id=int(row["id"]), email=str(row["email"]), username=str(row["username"]))
 
     @staticmethod
     def _row_to_debt(row: sqlite3.Row) -> DebtRecord:
@@ -351,18 +348,6 @@ class DormiXRepository:
             wants_skill_id=int(row["wants_skill_id"]),
             username=row["username"] if "username" in row.keys() else None,
         )
-
-
-def ensure_users(repo: DormiXRepository, usernames: Iterable[str]) -> dict[str, User]:
-    users: dict[str, User] = {}
-    for username in usernames:
-        normalized = DormiXRepository._normalize_username(username)
-        user = repo.get_user_by_username(normalized)
-        if user is None:
-            user = repo.create_user(normalized, f"token-{normalized}")
-        users[normalized] = user
-    return users
-
 
 DebtRepository = DormiXRepository
 BarterRepository = DormiXRepository
